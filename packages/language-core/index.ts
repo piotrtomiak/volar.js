@@ -13,16 +13,54 @@ import { FileMap } from './lib/utils';
 export function createLanguage(plugins: LanguagePlugin[], caseSensitive: boolean, sync: (id: string) => void): Language {
 
 	const sourceScripts = new FileMap<SourceScript>(caseSensitive);
+	const nonTsSourceScripts = new FileMap<SourceScript>(caseSensitive);
+
+	const sourceScriptToMappedFiles = new Map<SourceScript, string[]>()
+	const mappedFilesToSourceScript = new FileMap<SourceScript>(caseSensitive);
+
 	const virtualCodeToSourceFileMap = new WeakMap<VirtualCode, SourceScript>();
 	const virtualCodeToMaps = new WeakMap<ts.IScriptSnapshot, Map<string, [ts.IScriptSnapshot, SourceMap<CodeInformation>]>>();
 	const virtualCodeToLinkedCodeMap = new WeakMap<ts.IScriptSnapshot, LinkedCodeMap | undefined>();
+
+	function unregisterSourceScript(sourceScript: SourceScript) {
+		for (const mappedFile of sourceScriptToMappedFiles.get(sourceScript) ?? []) {
+			mappedFilesToSourceScript.delete(mappedFile);
+		}
+		sourceScriptToMappedFiles.delete(sourceScript)
+	}
+
+	function registerSourceScript(sourceScript: SourceScript, virtualCode: VirtualCode) {
+		if (!sourceScript.generated) {
+			return
+		}
+		const mappedFiles: string[] = []
+		unregisterSourceScript(sourceScript)
+		sourceScriptToMappedFiles.set(sourceScript, mappedFiles)
+		for (const code of forEachEmbeddedCode(virtualCode)) {
+			virtualCodeToSourceFileMap.set(code, sourceScript);
+			sourceScript.generated.embeddedCodes.set(code.id, code);
+			for (const mapping of code.mappings) {
+				if (mapping.source && mapping.source !== sourceScript.id) {
+					mappedFiles.push(mapping.source)
+					mappedFilesToSourceScript.set(mapping.source, sourceScript)
+				}
+			}
+		}
+	}
+
+	function normalizeId(id: string): string {
+		return caseSensitive ? id : id.toLowerCase();
+	}
 
 	return {
 		plugins,
 		scripts: {
 			get(id) {
 				sync(id);
-				return sourceScripts.get(id);
+				return sourceScripts.get(id) ?? nonTsSourceScripts.get(id)
+			},
+			getGeneratedTarget(id) {
+				return mappedFilesToSourceScript.get(id)
 			},
 			set(id, snapshot, languageId, _plugins = plugins) {
 				if (!languageId) {
@@ -37,66 +75,93 @@ export function createLanguage(plugins: LanguagePlugin[], caseSensitive: boolean
 					console.warn(`languageId not found for ${id}`);
 					return;
 				}
-				if (sourceScripts.has(id)) {
-					const sourceScript = sourceScripts.get(id)!;
-					if (sourceScript.languageId !== languageId) {
-						// languageId changed
+				let isMappingSourceOnly = false;
+				for (const plugin of plugins) {
+					if (plugin.isNonTS?.(id, languageId)) {
+						isMappingSourceOnly = true
+						break;
+					}
+				}
+				if (!isMappingSourceOnly) {
+					if (nonTsSourceScripts.has(id)) {
 						this.delete(id);
 						return this.set(id, snapshot, languageId);
-					}
-					else if (sourceScript.snapshot !== snapshot) {
-						// snapshot updated
-						sourceScript.snapshot = snapshot;
-						if (sourceScript.generated) {
-							const newVirtualCode = sourceScript.generated.languagePlugin.updateVirtualCode?.(id, sourceScript.generated.root, snapshot);
-							if (newVirtualCode) {
-								sourceScript.generated.root = newVirtualCode;
-								sourceScript.generated.embeddedCodes.clear();
-								for (const code of forEachEmbeddedCode(sourceScript.generated.root)) {
-									virtualCodeToSourceFileMap.set(code, sourceScript);
-									sourceScript.generated.embeddedCodes.set(code.id, code);
+					} else if (sourceScripts.has(id)) {
+						const sourceScript = sourceScripts.get(id)!;
+						if (sourceScript.languageId !== languageId) {
+							// languageId changed
+							this.delete(id);
+							return this.set(id, snapshot, languageId);
+						} else if (sourceScript.snapshot !== snapshot) {
+							// snapshot updated
+							sourceScript.snapshot = snapshot;
+							if (sourceScript.generated) {
+								const newVirtualCode = sourceScript.generated.languagePlugin.updateVirtualCode?.(id, sourceScript.generated.root, snapshot);
+								if (newVirtualCode) {
+									sourceScript.generated.root = newVirtualCode;
+									sourceScript.generated.embeddedCodes.clear();
+									registerSourceScript(sourceScript, newVirtualCode);
+									return sourceScript;
+								} else {
+									this.delete(id);
+									return;
 								}
-								return sourceScript;
 							}
-							else {
-								this.delete(id);
-								return;
+						} else {
+							// not changed
+							return sourceScript;
+						}
+					} else {
+						// created
+						const sourceScript: SourceScript = { id, languageId, snapshot };
+						sourceScripts.set(id, sourceScript);
+						for (const languagePlugin of _plugins) {
+							const virtualCode = languagePlugin.createVirtualCode?.(id, languageId, snapshot);
+							if (virtualCode) {
+								sourceScript.generated = {
+									root: virtualCode,
+									languagePlugin,
+									embeddedCodes: new Map(),
+								};
+								registerSourceScript(sourceScript, virtualCode);
+								break;
 							}
 						}
+						return sourceScript;
 					}
-					else {
-						// not changed
+				} else {
+					if (sourceScripts.has(id)) {
+						this.delete(id);
+						return this.set(id, snapshot, languageId);
+					} if (nonTsSourceScripts.has(id)) {
+						const sourceScript = nonTsSourceScripts.get(id)!;
+						if (sourceScript.languageId !== languageId) {
+							// languageId changed
+							this.delete(id);
+							return this.set(id, snapshot, languageId);
+						} else if (sourceScript.snapshot !== snapshot) {
+							// snapshot updated
+							sourceScript.snapshot = snapshot;
+						} else {
+							// not changed
+							return sourceScript;
+						}
+					} else {
+						// created
+						const sourceScript: SourceScript = { id, languageId, snapshot, nonTs: true };
+						nonTsSourceScripts.set(id, sourceScript);
 						return sourceScript;
 					}
 				}
-				else {
-					// created
-					const sourceScript: SourceScript = { id, languageId, snapshot };
-					sourceScripts.set(id, sourceScript);
-					for (const languagePlugin of _plugins) {
-						const virtualCode = languagePlugin.createVirtualCode?.(id, languageId, snapshot);
-						if (virtualCode) {
-							sourceScript.generated = {
-								root: virtualCode,
-								languagePlugin,
-								embeddedCodes: new Map(),
-							};
-							for (const code of forEachEmbeddedCode(virtualCode)) {
-								virtualCodeToSourceFileMap.set(code, sourceScript);
-								sourceScript.generated.embeddedCodes.set(code.id, code);
-							}
-							break;
-						}
-					}
-					return sourceScript;
-				}
 			},
 			delete(id) {
+				nonTsSourceScripts.delete(id)
 				const value = sourceScripts.get(id);
 				if (value) {
 					if (value.generated) {
 						value.generated.languagePlugin.disposeVirtualCode?.(id, value.generated.root);
 					}
+					unregisterSourceScript(value)
 					sourceScripts.delete(id);
 				}
 			},
@@ -110,8 +175,9 @@ export function createLanguage(plugins: LanguagePlugin[], caseSensitive: boolean
 					}
 					scriptId = sourceScript.id;
 				}
+				scriptId = normalizeId(scriptId)
 				for (const [id, [_snapshot, map]] of this.forEach(virtualCode)) {
-					if (id === scriptId) {
+					if (normalizeId(id) === scriptId) {
 						return map;
 					}
 				}
@@ -124,7 +190,7 @@ export function createLanguage(plugins: LanguagePlugin[], caseSensitive: boolean
 				}
 				updateVirtualCodeMapOfMap(virtualCode, map, id => {
 					if (id) {
-						const sourceScript = sourceScripts.get(id)!;
+						const sourceScript = sourceScripts.get(id)! ?? nonTsSourceScripts.get(id)!;
 						return [id, sourceScript.snapshot];
 					}
 					else {
@@ -173,7 +239,7 @@ export function updateVirtualCodeMapOfMap(
 			continue;
 		}
 		if (!mapOfMap.has(source[0]) || mapOfMap.get(source[0])![0] !== source[1]) {
-			mapOfMap.set(source[0], [source[1], new SourceMap(virtualCode.mappings.filter(mapping2 => mapping2.source === mapping.source))]);
+			mapOfMap.set(source[0], [source[1], new SourceMap(virtualCode.mappings, source[0])]);
 		}
 	}
 }

@@ -1,5 +1,6 @@
-import { Language, CodeInformation, shouldReportDiagnostics, SourceMap, SourceScript } from '@volar/language-core';
+import { CodeInformation, Language, shouldReportDiagnostics, SourceMap, SourceScript } from '@volar/language-core';
 import type * as ts from 'typescript';
+import type { TextChange } from 'typescript';
 import { getServiceScript, notEmpty } from './utils';
 
 const transformedDiagnostics = new WeakMap<ts.Diagnostic, ts.Diagnostic | undefined>();
@@ -10,19 +11,27 @@ export function transformCallHierarchyItem(language: Language, item: ts.CallHier
 	const selectionSpan = transformSpan(language, item.file, item.selectionSpan, filter);
 	return {
 		...item,
+		file: span?.fileName ?? item.file,
 		span: span?.textSpan ?? { start: 0, length: 0 },
 		selectionSpan: selectionSpan?.textSpan ?? { start: 0, length: 0 },
 	};
 }
 
-export function transformDiagnostic<T extends ts.Diagnostic>(language: Language, diagnostic: T, isTsc: boolean): T | undefined {
+
+export function transformAndFilterDiagnostics<T extends ts.Diagnostic>(diagnostics: readonly T[], language: Language, fileName: string, program: ts.Program | undefined, isTsc: boolean): T[] {
+	return diagnostics.map(d => transformDiagnostic(language, d, program, isTsc))
+		.filter(d => d?.file?.fileName == fileName)
+		.filter(notEmpty)
+}
+
+export function transformDiagnostic<T extends ts.Diagnostic>(language: Language, diagnostic: T, program: ts.Program | undefined, isTsc: boolean): T | undefined {
 	if (!transformedDiagnostics.has(diagnostic)) {
 		transformedDiagnostics.set(diagnostic, undefined);
 
 		const { relatedInformation } = diagnostic;
 		if (relatedInformation) {
 			diagnostic.relatedInformation = relatedInformation
-				.map(d => transformDiagnostic(language, d, isTsc))
+				.map(d => transformDiagnostic(language, d, program, isTsc))
 				.filter(notEmpty);
 		}
 
@@ -33,23 +42,30 @@ export function transformDiagnostic<T extends ts.Diagnostic>(language: Language,
 		) {
 			const [serviceScript, sourceScript, map] = getServiceScript(language, diagnostic.file.fileName);
 			if (serviceScript) {
-				const sourceSpan = transformTextSpan(sourceScript, map, { start: diagnostic.start, length: diagnostic.length }, shouldReportDiagnostics);
-				if (sourceSpan) {
+				const [sourceSpanFileName, sourceSpan] = transformTextSpan(sourceScript, map, {
+					start: diagnostic.start,
+					length: diagnostic.length
+				}, shouldReportDiagnostics) ?? [];
+				const actualDiagnosticFile = sourceSpanFileName
+					? diagnostic.file.fileName === sourceSpanFileName
+						? diagnostic.file
+						: program?.getSourceFile(sourceSpanFileName)
+					: undefined;
+				if (sourceSpan && actualDiagnosticFile) {
 					if (isTsc) {
 						fillSourceFileText(language, diagnostic.file);
 					}
 					transformedDiagnostics.set(diagnostic, {
 						...diagnostic,
+						file: actualDiagnosticFile,
 						start: sourceSpan.start,
 						length: sourceSpan.length,
 					});
 				}
-			}
-			else {
+			} else {
 				transformedDiagnostics.set(diagnostic, diagnostic);
 			}
-		}
-		else {
+		} else {
 			transformedDiagnostics.set(diagnostic, diagnostic);
 		}
 	}
@@ -69,25 +85,38 @@ export function fillSourceFileText(language: Language, sourceFile: ts.SourceFile
 	}
 }
 
-export function transformFileTextChanges(language: Language, changes: ts.FileTextChanges, filter: (data: CodeInformation) => boolean): ts.FileTextChanges | undefined {
-	const [_, source] = getServiceScript(language, changes.fileName);
-	if (source) {
-		return {
-			...changes,
-			textChanges: changes.textChanges.map(c => {
-				const span = transformSpan(language, changes.fileName, c.span, filter);
-				if (span) {
-					return {
-						...c,
-						span: span.textSpan,
-					};
+export function transformFileTextChanges(language: Language, changes: readonly ts.FileTextChanges[], filter: (data: CodeInformation) => boolean): ts.FileTextChanges[] {
+	const changesPerFile: { [fileName: string]: TextChange[] } = {}
+	const newFiles = new Set<string>();
+	for (const fileChanges of changes) {
+		const [_, source] = getServiceScript(language, fileChanges.fileName);
+		if (source) {
+			fileChanges.textChanges.forEach(c => {
+				const { fileName, textSpan } = transformSpan(language, fileChanges.fileName, c.span, filter) ?? {};
+				if (fileName && textSpan) {
+					(changesPerFile[fileName] ?? (changesPerFile[fileName] = [])).push({ ...c, span: textSpan })
 				}
-			}).filter(notEmpty),
-		};
+			})
+
+		} else {
+			const list = (changesPerFile[fileChanges.fileName] ?? (changesPerFile[fileChanges.fileName] = []))
+			fileChanges.textChanges.forEach(c => {
+				list.push(c)
+			})
+			if (fileChanges.isNewFile) {
+				newFiles.add(fileChanges.fileName)
+			}
+		}
 	}
-	else {
-		return changes;
+	const result: ts.FileTextChanges[] = []
+	for (const fileName in changesPerFile) {
+		result.push({
+			fileName,
+			isNewFile: newFiles.has(fileName),
+			textChanges: changesPerFile[fileName]
+		})
 	}
+	return result
 }
 
 export function transformDocumentSpan<T extends ts.DocumentSpan>(language: Language, documentSpan: T, filter: (data: CodeInformation) => boolean, shouldFallback?: boolean): T | undefined {
@@ -123,16 +152,17 @@ export function transformSpan(language: Language, fileName: string | undefined, 
 		return;
 	}
 	const [virtualFile, sourceScript, map] = getServiceScript(language, fileName);
-	if (virtualFile) {
-		const sourceSpan = transformTextSpan(sourceScript, map, textSpan, filter);
-		if (sourceSpan) {
+	if (sourceScript?.nonTs) {
+		return;
+	} else if (virtualFile) {
+		const [sourceSpanFileName, sourceSpan] = transformTextSpan(sourceScript, map, textSpan, filter) ?? [];
+		if (sourceSpan && sourceSpanFileName) {
 			return {
-				fileName,
+				fileName: sourceSpanFileName,
 				textSpan: sourceSpan,
 			};
 		}
-	}
-	else {
+	} else {
 		return {
 			fileName,
 			textSpan,
@@ -145,13 +175,13 @@ export function transformTextChange(
 	map: SourceMap<CodeInformation>,
 	textChange: ts.TextChange,
 	filter: (data: CodeInformation) => boolean,
-): ts.TextChange | undefined {
-	const sourceSpan = transformTextSpan(sourceScript, map, textChange.span, filter);
-	if (sourceSpan) {
-		return {
+): [string, ts.TextChange] | undefined {
+	const [sourceSpanFileName, sourceSpan] = transformTextSpan(sourceScript, map, textChange.span, filter) ?? [];
+	if (sourceSpan && sourceSpanFileName) {
+		return [sourceSpanFileName, {
 			newText: textChange.newText,
 			span: sourceSpan,
-		};
+		}];
 	}
 }
 
@@ -160,23 +190,24 @@ export function transformTextSpan(
 	map: SourceMap<CodeInformation>,
 	textSpan: ts.TextSpan,
 	filter: (data: CodeInformation) => boolean,
-): ts.TextSpan | undefined {
+): [string, ts.TextSpan] | undefined {
 	const start = textSpan.start;
 	const end = textSpan.start + textSpan.length;
-	const sourceStart = toSourceOffset(sourceScript, map, start, filter);
-	const sourceEnd = toSourceOffset(sourceScript, map, end, filter);
-	if (sourceStart !== undefined && sourceEnd !== undefined && sourceEnd >= sourceStart) {
-		return {
+	const [idStart, sourceStart] = toSourceOffset(sourceScript, map, start, filter) ?? [];
+	const [idEnd, sourceEnd] = toSourceOffset(sourceScript, map, end, filter) ?? [];
+	if (idStart === idEnd && idStart !== undefined
+		&& sourceStart !== undefined && sourceEnd !== undefined && sourceEnd >= sourceStart) {
+		return [idStart, {
 			start: sourceStart,
 			length: sourceEnd - sourceStart,
-		};
+		}];
 	}
 }
 
-export function toSourceOffset(sourceScript: SourceScript, map: SourceMap, position: number, filter: (data: CodeInformation) => boolean) {
+export function toSourceOffset(sourceScript: SourceScript, map: SourceMap, position: number, filter: (data: CodeInformation) => boolean): [string, number] | undefined {
 	for (const [sourceOffset, mapping] of map.getSourceOffsets(position - sourceScript.snapshot.getLength())) {
 		if (filter(mapping.data)) {
-			return sourceOffset;
+			return [mapping.source ?? sourceScript.id, sourceOffset];
 		}
 	}
 }

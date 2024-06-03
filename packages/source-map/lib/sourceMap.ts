@@ -22,7 +22,7 @@ export class SourceMap<Data = any> {
 	private sourceCodeOffsetsMemo: MappingMemo<Data> | undefined;
 	private generatedCodeOffsetsMemo: MappingMemo<Data> | undefined;
 
-	constructor(public readonly mappings: Mapping<Data>[]) { }
+	constructor(public readonly mappings: Mapping<Data>[], private sourceFile?: string) { }
 
 	getSourceOffset(generatedOffset: number) {
 		for (const mapped of this.findMatching(generatedOffset, 'generatedOffsets', 'sourceOffsets')) {
@@ -76,7 +76,10 @@ export class SourceMap<Data = any> {
 
 	private createMemo(key: CodeRangeKey): MappingMemo<Data> {
 		const offsetsSet = new Set<number>();
-		for (const mapping of this.mappings) {
+		const filteredMappings = this.sourceFile && key === 'sourceOffsets'
+			? this.mappings.filter(mapping => mapping.source === this.sourceFile)
+			: this.mappings
+		for (const mapping of filteredMappings) {
 			for (let i = 0; i < mapping[key].length; i++) {
 				offsetsSet.add(mapping[key][i]);
 				offsetsSet.add(mapping[key][i] + getLengths(mapping, key)[i]);
@@ -86,7 +89,7 @@ export class SourceMap<Data = any> {
 		const offsets = [...offsetsSet].sort((a, b) => a - b);
 		const mappings = offsets.map(() => new Set<Mapping<Data>>());
 
-		for (const mapping of this.mappings) {
+		for (const mapping of filteredMappings) {
 			for (let i = 0; i < mapping[key].length; i++) {
 				const startIndex = binarySearch(offsets, mapping[key][i]).match!;
 				const endIndex = binarySearch(offsets, mapping[key][i] + getLengths(mapping, key)[i]).match!;

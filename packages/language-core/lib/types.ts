@@ -6,6 +6,7 @@ export interface Language {
 	plugins: LanguagePlugin[];
 	scripts: {
 		get(id: string): SourceScript | undefined;
+		getGeneratedTarget(id: string): SourceScript | undefined;
 		set(id: string, snapshot: ts.IScriptSnapshot, languageId?: string, plugins?: LanguagePlugin[]): SourceScript | undefined;
 		delete(id: string): void;
 	};
@@ -30,6 +31,7 @@ export interface SourceScript {
 	id: string;
 	languageId: string;
 	snapshot: ts.IScriptSnapshot;
+	nonTs?: boolean;
 	generated?: {
 		root: VirtualCode;
 		languagePlugin: LanguagePlugin;
@@ -90,6 +92,10 @@ export interface LanguagePlugin<T extends VirtualCode = VirtualCode> {
 	createVirtualCode?(scriptId: string, languageId: string, snapshot: ts.IScriptSnapshot): T | undefined;
 	updateVirtualCode?(scriptId: string, virtualCode: T, newSnapshot: ts.IScriptSnapshot): T | undefined;
 	disposeVirtualCode?(scriptId: string, virtualCode: T): void;
+	/**
+	 * TS Plugin only
+	 */
+	isNonTS?(scriptId: string, languageId: string): boolean;
 	typescript?: {
 		/**
 		 * LSP + TS Plugin
